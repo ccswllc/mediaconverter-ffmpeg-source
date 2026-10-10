@@ -1,0 +1,497 @@
+diff --git a/configure b/configure
+index 374bd5c..4f0bfc8 100755
+--- a/configure
++++ b/configure
+@@ -6187,7 +6187,7 @@ case $target_os in
+         SLIBNAME_WITH_MAJOR='$(SLIBPREF)$(FULLNAME).$(LIBMAJOR)$(SLIBSUF)'
+         enabled x86_64 && objformat="macho64" || objformat="macho32"
+         enabled_any pic shared x86_64 ||
+-            { check_cflags -mdynamic-no-pic && add_asflags -mdynamic-no-pic; }
++            { check_cflags -mdynamic-no-pic; }
+         check_headers dispatch/dispatch.h &&
+             add_cppflags '-I\$(SRC_PATH)/compat/dispatch_semaphore'
+         if test -n "$sysroot"; then
+diff --git a/ffbuild/common.mak b/ffbuild/common.mak
+index 059de5a..8875e3d 100644
+--- a/ffbuild/common.mak
++++ b/ffbuild/common.mak
+@@ -47,7 +47,7 @@ $(call PREPEND,CXXFLAGS, CPPFLAGS)
+ X86ASMFLAGS += $(IFLAGS:%=%/) -I$(<D)/ -Pconfig.asm
+ 
+ HOSTCCFLAGS = $(IFLAGS) $(HOSTCPPFLAGS) $(HOSTCFLAGS)
+-LDFLAGS    := $(ALLFFLIBS:%=$(LD_PATH)lib%) $(LDFLAGS)
++LDFLAGS    := $(ALLFFLIBS:%=-F /Users/build/src/ffmpeg-kit-next/prebuilt/apple-ios-arm64-simulator-18.0/ffmpeg/framework) $(LDFLAGS)
+ 
+ define COMPILE
+        $(call $(1)DEP,$(1))
+@@ -208,7 +208,7 @@ FFLIBS    := $($(NAME)_FFLIBS) $(FFLIBS-yes) $(FFLIBS)
+ TESTPROGS += $(TESTPROGS-yes)
+ 
+ LDLIBS       = $(FFLIBS:%=%$(BUILDSUF))
+-FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB)) $(foreach lib,EXTRALIBS-$(NAME) $(FFLIBS:%=EXTRALIBS-%),$($(lib))) $(EXTRALIBS)
++FFEXTRALIBS := $(LDLIBS:%=-framework lib% ) $(foreach lib,EXTRALIBS-$(NAME) $(FFLIBS:%=EXTRALIBS-%),$($(lib))) $(EXTRALIBS)
+ 
+ OBJS      := $(sort $(OBJS:%=$(SUBDIR)%))
+ SHLIBOBJS := $(sort $(SHLIBOBJS:%=$(SUBDIR)%))
+diff --git a/libavformat/file.c b/libavformat/file.c
+index 71d30a2..8b732ca 100644
+--- a/libavformat/file.c
++++ b/libavformat/file.c
+@@ -693,3 +693,214 @@ const URLProtocol ff_android_content_protocol = {
+ };
+ 
+ #endif /* CONFIG_ANDROID_CONTENT_PROTOCOL */
++#include "libavutil/file.h"
++
++typedef struct FFKitProtocolContext {
++    const AVClass *class;
++    void *handle;
++} FFKitProtocolContext;
++
++static int ffkit_parse_protocol_id(const char *filename, const char *protocol,
++                                   int64_t *id)
++{
++    const char *id_string = NULL;
++    const char *p;
++    int64_t parsed_id = 0;
++
++    if (!av_strstart(filename, protocol, &id_string)) {
++        return AVERROR(EINVAL);
++    }
++
++    if (!av_isdigit(*id_string)) {
++        return AVERROR(EINVAL);
++    }
++
++    for (p = id_string; av_isdigit(*p); p++) {
++        int digit = *p - '0';
++        if (parsed_id > (INT64_MAX - digit) / 10) {
++            return AVERROR(EINVAL);
++        }
++        parsed_id = parsed_id * 10 + digit;
++    }
++
++    if (*p && *p != '.') {
++        return AVERROR(EINVAL);
++    }
++
++    *id = parsed_id;
++    return 0;
++}
++
++static int ffkitmem_open(URLContext *h, const char *filename, int flags)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    int64_t id;
++    int ret = ffkit_parse_protocol_id(filename, "ffkitmem:", &id);
++    ffkit_protocol_open_function open_function = av_get_ffkitmem_open();
++
++    if (ret < 0) {
++        av_log(h, AV_LOG_ERROR, "Invalid ffkitmem URL '%s'.\n", filename);
++        return ret;
++    }
++
++    if (open_function == NULL) {
++        av_log(h, AV_LOG_ERROR, "Cannot open ffkitmem URL '%s': no open callback registered.\n", filename);
++        return AVERROR(ENOSYS);
++    }
++
++    ret = open_function(id, flags, &c->handle);
++    if (ret < 0) {
++        c->handle = NULL;
++        return ret;
++    }
++
++    h->is_streamed = 0;
++    return 0;
++}
++
++static int ffkitmem_read(URLContext *h, unsigned char *buf, int size)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_read_function read_function = av_get_ffkitmem_read();
++
++    return read_function == NULL ? AVERROR(ENOSYS)
++                                 : read_function(c->handle, buf, size);
++}
++
++static int ffkitmem_write(URLContext *h, const unsigned char *buf, int size)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_write_function write_function = av_get_ffkitmem_write();
++
++    return write_function == NULL ? AVERROR(ENOSYS)
++                                  : write_function(c->handle, buf, size);
++}
++
++static int64_t ffkitmem_seek(URLContext *h, int64_t pos, int whence)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_seek_function seek_function = av_get_ffkitmem_seek();
++
++    return seek_function == NULL ? AVERROR(ENOSYS)
++                                 : seek_function(c->handle, pos, whence);
++}
++
++static int ffkitmem_close(URLContext *h)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_close_function close_function = av_get_ffkitmem_close();
++
++    /*
++     * Return convention: 0 on success, negative AVERROR on failure (FFmpeg's
++     * url_close contract). The ffkitmem close callback already follows this
++     * convention, so its value is passed through unchanged; a missing callback
++     * is a successful no-op. (Unlike saf_close, whose boolean callback must be
++     * translated -- do not unify the two.)
++     */
++    return close_function == NULL ? 0 : close_function(c->handle);
++}
++
++static int ffkitstream_open(URLContext *h, const char *filename, int flags)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    int64_t id;
++    int ret = ffkit_parse_protocol_id(filename, "ffkitstream:", &id);
++    ffkit_protocol_open_function open_function = av_get_ffkitstream_open();
++
++    if (ret < 0) {
++        av_log(h, AV_LOG_ERROR, "Invalid ffkitstream URL '%s'.\n", filename);
++        return ret;
++    }
++
++    if (open_function == NULL) {
++        av_log(h, AV_LOG_ERROR, "Cannot open ffkitstream URL '%s': no open callback registered.\n", filename);
++        return AVERROR(ENOSYS);
++    }
++
++    ret = open_function(id, flags, &c->handle);
++    if (ret < 0) {
++        c->handle = NULL;
++        return ret;
++    }
++
++    h->is_streamed = 1;
++    return 0;
++}
++
++static int ffkitstream_read(URLContext *h, unsigned char *buf, int size)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_read_function read_function = av_get_ffkitstream_read();
++
++    return read_function == NULL ? AVERROR(ENOSYS)
++                                 : read_function(c->handle, buf, size);
++}
++
++static int ffkitstream_write(URLContext *h, const unsigned char *buf, int size)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_write_function write_function = av_get_ffkitstream_write();
++
++    return write_function == NULL ? AVERROR(ENOSYS)
++                                  : write_function(c->handle, buf, size);
++}
++
++static int64_t ffkitstream_seek(URLContext *h, int64_t pos, int whence)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_seek_function seek_function = av_get_ffkitstream_seek();
++
++    return seek_function == NULL ? AVERROR(ESPIPE)
++                                 : seek_function(c->handle, pos, whence);
++}
++
++static int ffkitstream_close(URLContext *h)
++{
++    FFKitProtocolContext *c = h->priv_data;
++    ffkit_protocol_close_function close_function = av_get_ffkitstream_close();
++
++    /*
++     * Return convention: 0 on success, negative AVERROR on failure (FFmpeg's
++     * url_close contract). The ffkitstream close callback already follows this
++     * convention, so its value is passed through unchanged; a missing callback
++     * is a successful no-op. (Unlike saf_close, whose boolean callback must be
++     * translated -- do not unify the two.)
++     */
++    return close_function == NULL ? 0 : close_function(c->handle);
++}
++
++static const AVClass ffkitmem_class = {
++    .class_name = "ffkitmem",
++    .item_name  = av_default_item_name,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++static const AVClass ffkitstream_class = {
++    .class_name = "ffkitstream",
++    .item_name  = av_default_item_name,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++const URLProtocol ff_ffkitmem_protocol = {
++    .name              = "ffkitmem",
++    .url_open          = ffkitmem_open,
++    .url_read          = ffkitmem_read,
++    .url_write         = ffkitmem_write,
++    .url_seek          = ffkitmem_seek,
++    .url_close         = ffkitmem_close,
++    .priv_data_size    = sizeof(FFKitProtocolContext),
++    .priv_data_class   = &ffkitmem_class,
++    .default_whitelist = "ffkitmem,crypto,data"
++};
++
++const URLProtocol ff_ffkitstream_protocol = {
++    .name              = "ffkitstream",
++    .url_open          = ffkitstream_open,
++    .url_read          = ffkitstream_read,
++    .url_write         = ffkitstream_write,
++    .url_seek          = ffkitstream_seek,
++    .url_close         = ffkitstream_close,
++    .priv_data_size    = sizeof(FFKitProtocolContext),
++    .priv_data_class   = &ffkitstream_class,
++    .default_whitelist = "ffkitstream,crypto,data"
++};
+diff --git a/libavformat/hls.c b/libavformat/hls.c
+index 0e1a1ba..a647dd0 100644
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -703,7 +703,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+         return AVERROR_INVALIDDATA;
+ 
+     // only http(s) & file are allowed
+-    if (av_strstart(proto_name, "file", NULL)) {
++    if (av_strstart(proto_name, "file", NULL) || av_strstart(proto_name, "ffkitmem", NULL) || av_strstart(proto_name, "ffkitstream", NULL)) {
+         if (strcmp(c->allowed_extensions, "ALL") && !av_match_ext(url, c->allowed_extensions)) {
+             av_log(s, AV_LOG_ERROR,
+                 "Filename extension of \'%s\' is not a common multimedia extension, blocked for security reasons.\n"
+diff --git a/libavformat/protocols.c b/libavformat/protocols.c
+index 257b419..7dd03f7 100644
+--- a/libavformat/protocols.c
++++ b/libavformat/protocols.c
+@@ -36,6 +36,8 @@ extern const URLProtocol ff_fd_protocol;
+ extern const URLProtocol ff_ffrtmpcrypt_protocol;
+ extern const URLProtocol ff_ffrtmphttp_protocol;
+ extern const URLProtocol ff_file_protocol;
++extern const URLProtocol ff_ffkitmem_protocol;
++extern const URLProtocol ff_ffkitstream_protocol;
+ extern const URLProtocol ff_ftp_protocol;
+ extern const URLProtocol ff_gopher_protocol;
+ extern const URLProtocol ff_gophers_protocol;
+diff --git a/libavutil/file.c b/libavutil/file.c
+index 4ef940a..8e55826 100644
+--- a/libavutil/file.c
++++ b/libavutil/file.c
+@@ -151,3 +151,114 @@ void av_file_unmap(uint8_t *bufptr, size_t size)
+     av_free(bufptr);
+ #endif
+ }
++/*
++ * Copyright (c) 2021 Taner Sener
++ *
++ * This file is part of FFmpegKit.
++ *
++ * FFmpegKit is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpegKit is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with FFmpegKit.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++static saf_open_function _saf_open_function = NULL;
++static saf_close_function _saf_close_function = NULL;
++static ffkit_protocol_open_function _ffkitmem_open_function = NULL;
++static ffkit_protocol_read_function _ffkitmem_read_function = NULL;
++static ffkit_protocol_write_function _ffkitmem_write_function = NULL;
++static ffkit_protocol_seek_function _ffkitmem_seek_function = NULL;
++static ffkit_protocol_close_function _ffkitmem_close_function = NULL;
++static ffkit_protocol_open_function _ffkitstream_open_function = NULL;
++static ffkit_protocol_read_function _ffkitstream_read_function = NULL;
++static ffkit_protocol_write_function _ffkitstream_write_function = NULL;
++static ffkit_protocol_seek_function _ffkitstream_seek_function = NULL;
++static ffkit_protocol_close_function _ffkitstream_close_function = NULL;
++
++saf_open_function av_get_saf_open() {
++    return _saf_open_function;
++}
++
++saf_close_function av_get_saf_close() {
++    return _saf_close_function;
++}
++
++void av_set_saf_open(saf_open_function open_function) {
++    _saf_open_function = open_function;
++}
++
++void av_set_saf_close(saf_close_function close_function) {
++    _saf_close_function = close_function;
++}
++
++ffkit_protocol_open_function av_get_ffkitmem_open() {
++    return _ffkitmem_open_function;
++}
++
++ffkit_protocol_read_function av_get_ffkitmem_read() {
++    return _ffkitmem_read_function;
++}
++
++ffkit_protocol_write_function av_get_ffkitmem_write() {
++    return _ffkitmem_write_function;
++}
++
++ffkit_protocol_seek_function av_get_ffkitmem_seek() {
++    return _ffkitmem_seek_function;
++}
++
++ffkit_protocol_close_function av_get_ffkitmem_close() {
++    return _ffkitmem_close_function;
++}
++
++void av_set_ffkitmem_functions(ffkit_protocol_open_function open_function,
++                               ffkit_protocol_read_function read_function,
++                               ffkit_protocol_write_function write_function,
++                               ffkit_protocol_seek_function seek_function,
++                               ffkit_protocol_close_function close_function) {
++    _ffkitmem_open_function = open_function;
++    _ffkitmem_read_function = read_function;
++    _ffkitmem_write_function = write_function;
++    _ffkitmem_seek_function = seek_function;
++    _ffkitmem_close_function = close_function;
++}
++
++ffkit_protocol_open_function av_get_ffkitstream_open() {
++    return _ffkitstream_open_function;
++}
++
++ffkit_protocol_read_function av_get_ffkitstream_read() {
++    return _ffkitstream_read_function;
++}
++
++ffkit_protocol_write_function av_get_ffkitstream_write() {
++    return _ffkitstream_write_function;
++}
++
++ffkit_protocol_seek_function av_get_ffkitstream_seek() {
++    return _ffkitstream_seek_function;
++}
++
++ffkit_protocol_close_function av_get_ffkitstream_close() {
++    return _ffkitstream_close_function;
++}
++
++void av_set_ffkitstream_functions(ffkit_protocol_open_function open_function,
++                                  ffkit_protocol_read_function read_function,
++                                  ffkit_protocol_write_function write_function,
++                                  ffkit_protocol_seek_function seek_function,
++                                  ffkit_protocol_close_function close_function) {
++    _ffkitstream_open_function = open_function;
++    _ffkitstream_read_function = read_function;
++    _ffkitstream_write_function = write_function;
++    _ffkitstream_seek_function = seek_function;
++    _ffkitstream_close_function = close_function;
++}
+diff --git a/libavutil/file.h b/libavutil/file.h
+index fced170..f2c2063 100644
+--- a/libavutil/file.h
++++ b/libavutil/file.h
+@@ -60,3 +60,80 @@ int av_file_map(const char *filename, uint8_t **bufptr, size_t *size,
+ void av_file_unmap(uint8_t *bufptr, size_t size);
+ 
+ #endif /* AVUTIL_FILE_H */
++/*
++ * Copyright (c) 2021 Taner Sener
++ *
++ * This file is part of FFmpegKit.
++ *
++ * FFmpegKit is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpegKit is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with FFmpegKit.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef AVUTIL_FILE_FFMPEG_KIT_PROTOCOLS_H
++#define AVUTIL_FILE_FFMPEG_KIT_PROTOCOLS_H
++
++typedef int (*saf_open_function)(int);
++
++typedef int (*saf_close_function)(int);
++
++typedef int (*ffkit_protocol_open_function)(int64_t, int, void **);
++
++typedef int (*ffkit_protocol_read_function)(void *, unsigned char *, int);
++
++typedef int (*ffkit_protocol_write_function)(void *, const unsigned char *, int);
++
++typedef int64_t (*ffkit_protocol_seek_function)(void *, int64_t, int);
++
++typedef int (*ffkit_protocol_close_function)(void *);
++
++saf_open_function av_get_saf_open(void);
++
++saf_close_function av_get_saf_close(void);
++
++void av_set_saf_open(saf_open_function);
++
++void av_set_saf_close(saf_close_function);
++
++ffkit_protocol_open_function av_get_ffkitmem_open(void);
++
++ffkit_protocol_read_function av_get_ffkitmem_read(void);
++
++ffkit_protocol_write_function av_get_ffkitmem_write(void);
++
++ffkit_protocol_seek_function av_get_ffkitmem_seek(void);
++
++ffkit_protocol_close_function av_get_ffkitmem_close(void);
++
++void av_set_ffkitmem_functions(ffkit_protocol_open_function,
++                               ffkit_protocol_read_function,
++                               ffkit_protocol_write_function,
++                               ffkit_protocol_seek_function,
++                               ffkit_protocol_close_function);
++
++ffkit_protocol_open_function av_get_ffkitstream_open(void);
++
++ffkit_protocol_read_function av_get_ffkitstream_read(void);
++
++ffkit_protocol_write_function av_get_ffkitstream_write(void);
++
++ffkit_protocol_seek_function av_get_ffkitstream_seek(void);
++
++ffkit_protocol_close_function av_get_ffkitstream_close(void);
++
++void av_set_ffkitstream_functions(ffkit_protocol_open_function,
++                                  ffkit_protocol_read_function,
++                                  ffkit_protocol_write_function,
++                                  ffkit_protocol_seek_function,
++                                  ffkit_protocol_close_function);
++
++#endif /* AVUTIL_FILE_FFMPEG_KIT_PROTOCOLS_H */
+diff --git a/libavutil/log.c b/libavutil/log.c
+index b5d3e46..a54d6ce 100644
+--- a/libavutil/log.c
++++ b/libavutil/log.c
+@@ -56,7 +56,7 @@ static AVMutex mutex = AV_MUTEX_INITIALIZER;
+ #define BACKTRACE_LOGLEVEL AV_LOG_ERROR
+ #endif
+ 
+-static atomic_int av_log_level = AV_LOG_INFO;
++__thread atomic_int av_log_level = AV_LOG_INFO;
+ static atomic_int av_log_flags = 0;
+ 
+ #define NB_LEVELS 8
